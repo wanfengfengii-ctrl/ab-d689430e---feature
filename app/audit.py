@@ -7,12 +7,17 @@ from typing import Any
 
 from .decimal_math import coerce_decimal, decimal_to_fraction
 from .gcode import Move, ProgramError, execute, format_point
-from .geometry import first_move_violation
+from .geometry import (
+    boxes_intersect_closed,
+    envelope_box_within_workspace,
+    first_move_violation,
+)
 
 MAX_REGIONS = 20
 MAX_PROGRAM_LINES = 5000
 
 PointT = tuple[Fraction, Fraction, Fraction]
+EnvelopeT = tuple[PointT, PointT]
 
 
 class AuditError(ValueError):
@@ -60,11 +65,49 @@ def _workspace_from_payload(payload: Any) -> tuple[PointT, PointT]:
     return lo, hi
 
 
+def _envelope_from_payload(payload: Any) -> EnvelopeT:
+    if not isinstance(payload, dict):
+        raise AuditError("tool_envelope_mm must be an object with min and max")
+    lo = _point_from_payload(payload.get("min"), "tool_envelope_mm.min")
+    hi = _point_from_payload(payload.get("max"), "tool_envelope_mm.max")
+    for axis_i in range(3):
+        if not (lo[axis_i] <= 0 <= hi[axis_i]):
+            raise AuditError(
+                "tool_envelope_mm: every axis must satisfy min <= 0 <= max"
+            )
+    return lo, hi
+
+
+def _check_initial_envelope(
+    initial_mm: PointT,
+    envelope: EnvelopeT,
+    workspace: tuple[PointT, PointT],
+    regions: list[tuple[PointT, PointT]],
+) -> None:
+    """The full probe at the initial position must fit the closed workspace
+    and stay clear of every forbidden region (boundary contact included)."""
+    env_lo, env_hi = envelope
+    ws_lo, ws_hi = workspace
+    if not envelope_box_within_workspace(initial_mm, env_lo, env_hi,
+                                         ws_lo, ws_hi):
+        raise AuditError(
+            "initial tool envelope must lie within the closed workspace"
+        )
+    box_lo = tuple(initial_mm[i] + env_lo[i] for i in range(3))
+    box_hi = tuple(initial_mm[i] + env_hi[i] for i in range(3))
+    for index, (region_lo, region_hi) in enumerate(regions, start=1):
+        if boxes_intersect_closed(box_lo, box_hi, region_lo, region_hi):
+            raise AuditError(
+                f"initial tool envelope contacts forbidden region {index}"
+            )
+
+
 def _validate_request(data: Any) -> tuple[
     PointT,
     tuple[PointT, PointT],
     list[tuple[PointT, PointT]],
     str,
+    EnvelopeT | None,
 ]:
     if not isinstance(data, dict):
         raise AuditError("request body must be a JSON object")
@@ -81,6 +124,11 @@ def _validate_request(data: Any) -> tuple[
         if not (ws_lo[axis_i] <= initial_mm[axis_i] <= ws_hi[axis_i]):
             raise AuditError("initial_position_mm must lie within the closed workspace")
 
+    # Optional biased-probe envelope; omitted keeps the legacy semantics.
+    envelope: EnvelopeT | None = None
+    if "tool_envelope_mm" in data:
+        envelope = _envelope_from_payload(data["tool_envelope_mm"])
+
     raw_regions = data.get("forbidden_regions", [])
     if not isinstance(raw_regions, list):
         raise AuditError("forbidden_regions must be a list")
@@ -91,13 +139,16 @@ def _validate_request(data: Any) -> tuple[
         for index, item in enumerate(raw_regions)
     ]
 
+    if envelope is not None:
+        _check_initial_envelope(initial_mm, envelope, workspace, regions)
+
     if "program" not in data or not isinstance(data["program"], str):
         raise AuditError("program must be a string")
     program = data["program"]
     if len(program.splitlines()) > MAX_PROGRAM_LINES:
         raise AuditError(f"program may contain at most {MAX_PROGRAM_LINES} lines")
 
-    return initial_mm, workspace, regions, program
+    return initial_mm, workspace, regions, program, envelope
 
 
 def _serialise_segment(move: Move) -> dict:
@@ -120,7 +171,8 @@ def audit(data: Any) -> tuple[dict | None, dict | None]:
     On any failure no dispatchable partial toolpath is ever returned.
     """
     try:
-        initial_mm, workspace, regions, program_text = _validate_request(data)
+        initial_mm, workspace, regions, program_text, envelope = \
+            _validate_request(data)
     except AuditError as exc:
         return None, {"error": "invalid_request", "reason": str(exc)}
 
@@ -129,7 +181,8 @@ def audit(data: Any) -> tuple[dict | None, dict | None]:
     except ProgramError as exc:
         # An earlier line may already violate the geometry; the first
         # violation in program order wins over a later lexical error.
-        violation = first_move_violation(exc.partial_moves, workspace, regions)
+        violation = first_move_violation(exc.partial_moves, workspace,
+                                         regions, envelope)
         if violation is not None:
             error = {"error": violation["code"], "line": violation["line"],
                      "reason": violation["reason"]}
@@ -142,7 +195,7 @@ def audit(data: Any) -> tuple[dict | None, dict | None]:
             "reason": exc.reason,
         }
 
-    violation = first_move_violation(moves, workspace, regions)
+    violation = first_move_violation(moves, workspace, regions, envelope)
     if violation is not None:
         error = {"error": violation["code"], "line": violation["line"],
                  "reason": violation["reason"]}

@@ -387,3 +387,244 @@ def test_audit_endpoint_malformed_json(client):
     resp = client.post("/api/toolpaths/audit", data="not json",
                        content_type="application/json")
     assert resp.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# optional tool_envelope_mm (biased probe envelope)
+# ---------------------------------------------------------------------------
+
+# Asymmetric probe: reaches farther towards -z and +y than anywhere else.
+ENVELOPE = {"min": {"x": "-3", "y": "-2", "z": "-5"},
+            "max": {"x": "1", "y": "4", "z": "2"}}
+
+
+def run_envelope(program, envelope=ENVELOPE, regions=None, initial=(0, 0, 0),
+                 ws_min=(-100, -100, -100), ws_max=(100, 100, 100)):
+    return audit({
+        "initial_position_mm": {"x": initial[0], "y": initial[1], "z": initial[2]},
+        "workspace": {"min": {"x": ws_min[0], "y": ws_min[1], "z": ws_min[2]},
+                      "max": {"x": ws_max[0], "y": ws_max[1], "z": ws_max[2]}},
+        "forbidden_regions": regions or [],
+        "program": program,
+        "tool_envelope_mm": envelope,
+    })
+
+
+def test_envelope_accepted_response_is_reference_track():
+    ok, err = run_envelope("G21 G90 G0 X10 Y10 Z10\nG1 X20 Y0 Z-5")
+    assert err is None
+    assert ok["status"] == "accepted"
+    # Segments and final position remain the reference-point mm track;
+    # the envelope only gates acceptance, it is not echoed back.
+    assert ok["segments"] == [
+        {"start": {"x": "0", "y": "0", "z": "0"},
+         "end": {"x": "10", "y": "10", "z": "10"}, "motion": "G0", "line": 1},
+        {"start": {"x": "10", "y": "10", "z": "10"},
+         "end": {"x": "20", "y": "0", "z": "-5"}, "motion": "G1", "line": 2},
+    ]
+    assert ok["final_position_mm"] == {"x": "20", "y": "0", "z": "-5"}
+
+
+def test_envelope_inch_relative_program_normalizes_reference_track():
+    ok, err = run_envelope("G20 G91 G0 X1 Y0.5\nG1 X-0.25")
+    assert err is None
+    assert ok["final_position_mm"] == {"x": "19.05", "y": "12.7", "z": "0"}
+
+
+# --- envelope request validation (all invalid_request) ---
+
+def test_envelope_axis_must_straddle_zero():
+    bad_min = {"min": {"x": 0.5, "y": -1, "z": -1},
+               "max": {"x": 2, "y": 1, "z": 1}}
+    ok, err = run_envelope("G21 G90 G0 X1", envelope=bad_min)
+    assert ok is None and err["error"] == "invalid_request"
+    bad_max = {"min": {"x": -2, "y": -1, "z": -1},
+               "max": {"x": -0.5, "y": 1, "z": 1}}
+    ok, err = run_envelope("G21 G90 G0 X1", envelope=bad_max)
+    assert ok is None and err["error"] == "invalid_request"
+
+
+def test_envelope_structure_validation():
+    for bad in (None, "box", [1, 2], {}, {"min": {"x": -1, "y": -1, "z": -1}},
+                {"min": {"x": -1, "y": -1, "z": -1},
+                 "max": {"x": 1, "y": 1}},  # missing axis
+                {"min": {"x": "-1", "y": "-1", "z": "-1"},
+                 "max": {"x": "NaN", "y": "1", "z": "1"}}):
+        ok, err = run_envelope("G21 G90 G0 X1", envelope=bad)
+        assert ok is None, bad
+        assert err["error"] == "invalid_request", bad
+
+
+def test_envelope_initial_position_must_fit_workspace():
+    # Reference point (0,0,0) is inside, but the envelope reaches z=-5
+    # while the workspace only goes down to z=-4.
+    ok, err = run_envelope("G21 G90 G0 X1", ws_min=(-100, -100, -4))
+    assert ok is None
+    assert err["error"] == "invalid_request"
+    assert "envelope" in err["reason"]
+
+
+def test_envelope_initial_position_must_clear_forbidden_regions():
+    # Region x-lo = 1 is exactly reached by the envelope x-max = 1: contact.
+    region = box((1, -1, -1), (4, 1, 1))
+    ok, err = run_envelope("G21 G90 G0 X50", regions=[region])
+    assert ok is None
+    assert err["error"] == "invalid_request"
+    assert "forbidden region 1" in err["reason"]
+
+
+def test_envelope_initial_contact_rejected_even_with_empty_program():
+    region = box((1, -1, -1), (4, 1, 1))
+    ok, err = run_envelope("\n; no motion at all\n", regions=[region])
+    assert ok is None
+    assert err["error"] == "invalid_request"
+
+
+# --- swept-envelope adjudication of moves ---
+
+def test_envelope_swept_outside_workspace_uses_existing_code():
+    # Reference end z=99 is inside the z<=100 workspace, but the envelope
+    # top reaches 101.
+    ok, err = run_envelope("G21 G90 G0 X0 Y0 Z96\nG1 Z99")
+    assert ok is None
+    assert err["error"] == "outside_workspace"
+    assert err["line"] == 2
+    assert "segments" not in err
+
+
+def test_envelope_swept_contacts_region_reference_path_clear():
+    # Reference line y=18 clears the box y in [20,30] by 2 mm, but the
+    # envelope reaches y+4 and is swept straight through it.
+    region = box((20, 20, -1), (30, 30, 1))
+    ok, err = run_envelope("G21 G90 G0 X0 Y18 Z0\nG1 X40 Y18 Z0",
+                           regions=[region])
+    assert ok is None
+    assert err["error"] == "forbidden_contact"
+    assert err["line"] == 2
+    assert err["forbidden_region"] == 1
+    assert "segments" not in err
+    assert "final_position_mm" not in err
+
+
+def test_envelope_grazing_region_boundary_is_contact():
+    # Envelope y-max = 4 exactly reaches the region face y=5 along the move.
+    region = box((10, 5, -1), (20, 15, 1))
+    ok, err = run_envelope("G21 G90 G0 X0 Y1 Z0\nG1 X25 Y1 Z0",
+                           regions=[region])
+    assert ok is None
+    assert err["error"] == "forbidden_contact"
+    assert err["line"] == 2
+    assert err["forbidden_region"] == 1
+
+
+def test_envelope_workspace_boundary_is_closed():
+    # Envelope box [-3,1]x[-2,4]x[-5,2] exactly fills a tight workspace.
+    ok, err = run_envelope(
+        "G21 G90 G0 X0 Y0 Z0",
+        ws_min=(-3, -2, -5), ws_max=(1, 4, 2),
+    )
+    assert err is None
+    assert ok["final_position_mm"] == {"x": "0", "y": "0", "z": "0"}
+
+
+def test_envelope_first_violation_and_region_number_stable():
+    regions = [box((40, 40, -6), (60, 60, 6)),
+               box((4, 10, -6), (6, 30, 6))]
+    # The reference segment x=y threads between the boxes (region 2 needs
+    # x in [4,6] while y in [10,30], impossible for x=y), but the envelope
+    # swept along line 2 reaches region 2; line 3 would hit region 1 too —
+    # the first violation in program order must win.
+    program = "G21 G90 G0 X0 Y0\nG1 X14 Y14\nG1 X50 Y50"
+    ok, err = run_envelope(program, regions=regions)
+    assert ok is None
+    assert err["line"] == 2
+    assert err["forbidden_region"] == 2
+
+
+def test_envelope_zero_offsets_match_point_semantics_for_moves():
+    zero = {"min": {"x": 0, "y": 0, "z": 0}, "max": {"x": 0, "y": 0, "z": 0}}
+    region = box((4, 4, -1), (6, 6, 1))
+    ok, err = run_envelope("G21 G90 G0 X0 Y0\nG1 X10 Y10",
+                           envelope=zero, regions=[region])
+    assert ok is None
+    assert err["error"] == "forbidden_contact"
+    assert err["line"] == 2
+
+
+def test_envelope_geometry_violation_beats_later_lexical_error():
+    region = box((20, 20, -1), (30, 30, 1))
+    program = "G21 G90 G0 X0 Y18 Z0\nG1 X40 Y18 Z0\nM99"
+    ok, err = run_envelope(program, regions=[region])
+    assert ok is None
+    assert err["error"] == "forbidden_contact"
+    assert err["line"] == 2
+
+
+# --- omitted-field regression: nothing changes without the envelope ---
+
+def test_omitted_envelope_keeps_reference_only_semantics():
+    # The exact requests that fail above pass when the field is omitted.
+    region = box((20, 20, -1), (30, 30, 1))
+    ok, err = run("G21 G90 G0 X0 Y18 Z0\nG1 X40 Y18 Z0", regions=[region])
+    assert err is None and ok is not None
+    ok, err = run("G21 G90 G0 X0 Y0 Z96\nG1 Z99")
+    assert err is None and ok is not None
+
+
+def test_omitted_envelope_initial_contact_with_empty_program_accepted():
+    # Legacy semantics: without the envelope the initial position is only
+    # checked against the workspace, never against forbidden regions.
+    region = box((-1, -1, -1), (1, 1, 1))
+    ok, err = run("\n; no motion\n", regions=[region])
+    assert err is None
+    assert ok["segments"] == []
+
+
+# --- envelope over HTTP ---
+
+def test_audit_endpoint_envelope_accepted(client):
+    resp = client.post("/api/toolpaths/audit", json={
+        "initial_position_mm": {"x": 0, "y": 0, "z": 0},
+        "workspace": {"min": {"x": -50, "y": -50, "z": -50},
+                      "max": {"x": 50, "y": 50, "z": 50}},
+        "forbidden_regions": [],
+        "program": "G21 G90 G0 X10 Y10 Z10",
+        "tool_envelope_mm": ENVELOPE,
+    })
+    assert resp.status_code == 200
+    body = resp.get_json()
+    assert body["status"] == "accepted"
+    assert body["final_position_mm"] == {"x": "10", "y": "10", "z": "10"}
+
+
+def test_audit_endpoint_envelope_initial_violation_is_400(client):
+    resp = client.post("/api/toolpaths/audit", json={
+        "initial_position_mm": {"x": 0, "y": 0, "z": 0},
+        "workspace": {"min": {"x": -50, "y": -50, "z": -4},
+                      "max": {"x": 50, "y": 50, "z": 50}},
+        "forbidden_regions": [],
+        "program": "G21 G90 G0 X1",
+        "tool_envelope_mm": ENVELOPE,
+    })
+    assert resp.status_code == 400
+    assert resp.get_json()["error"] == "invalid_request"
+
+
+def test_audit_endpoint_envelope_swept_violation_is_422(client):
+    resp = client.post("/api/toolpaths/audit", json={
+        "initial_position_mm": {"x": 0, "y": 0, "z": 0},
+        "workspace": {"min": {"x": -50, "y": -50, "z": -50},
+                      "max": {"x": 50, "y": 50, "z": 50}},
+        "forbidden_regions": [
+            {"bounds": {"min": {"x": 20, "y": 20, "z": -1},
+                        "max": {"x": 30, "y": 30, "z": 1}}}
+        ],
+        "program": "G21 G90 G0 X0 Y18 Z0\nG1 X40 Y18 Z0",
+        "tool_envelope_mm": ENVELOPE,
+    })
+    assert resp.status_code == 422
+    body = resp.get_json()
+    assert body["error"] == "forbidden_contact"
+    assert body["line"] == 2
+    assert body["forbidden_region"] == 1
+    assert "segments" not in body
