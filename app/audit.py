@@ -7,7 +7,12 @@ from typing import Any
 
 from .decimal_math import coerce_decimal, decimal_to_fraction
 from .gcode import Move, ProgramError, execute, format_point
-from .geometry import first_move_violation
+from .geometry import (
+    boxes_touch_closed,
+    dilate_region,
+    erode_workspace,
+    first_move_violation,
+)
 
 MAX_REGIONS = 20
 MAX_PROGRAM_LINES = 5000
@@ -60,11 +65,30 @@ def _workspace_from_payload(payload: Any) -> tuple[PointT, PointT]:
     return lo, hi
 
 
+def _envelope_from_payload(payload: Any) -> tuple[PointT, PointT]:
+    """Validate the optional tool envelope: probe offsets from the reference.
+
+    ``min``/``max`` are canonical decimal millimetre offsets and every axis
+    must straddle the reference point: min <= 0 <= max.
+    """
+    if not isinstance(payload, dict):
+        raise AuditError("tool_envelope_mm must be an object with min and max")
+    lo = _point_from_payload(payload.get("min"), "tool_envelope_mm.min")
+    hi = _point_from_payload(payload.get("max"), "tool_envelope_mm.max")
+    for axis_i in range(3):
+        if not (lo[axis_i] <= 0 <= hi[axis_i]):
+            raise AuditError(
+                "tool_envelope_mm must satisfy min <= 0 <= max on every axis"
+            )
+    return lo, hi
+
+
 def _validate_request(data: Any) -> tuple[
     PointT,
     tuple[PointT, PointT],
     list[tuple[PointT, PointT]],
     str,
+    tuple[PointT, PointT] | None,
 ]:
     if not isinstance(data, dict):
         raise AuditError("request body must be a JSON object")
@@ -81,6 +105,10 @@ def _validate_request(data: Any) -> tuple[
         if not (ws_lo[axis_i] <= initial_mm[axis_i] <= ws_hi[axis_i]):
             raise AuditError("initial_position_mm must lie within the closed workspace")
 
+    envelope: tuple[PointT, PointT] | None = None
+    if "tool_envelope_mm" in data:
+        envelope = _envelope_from_payload(data["tool_envelope_mm"])
+
     raw_regions = data.get("forbidden_regions", [])
     if not isinstance(raw_regions, list):
         raise AuditError("forbidden_regions must be a list")
@@ -91,13 +119,38 @@ def _validate_request(data: Any) -> tuple[
         for index, item in enumerate(raw_regions)
     ]
 
+    if envelope is not None:
+        # The complete probe at the initial position must fit the closed
+        # workspace and stay clear of every forbidden region (boundary
+        # contact included); anything else is a request-level failure.
+        env_lo, env_hi = envelope
+        probe_lo = (initial_mm[0] + env_lo[0],
+                    initial_mm[1] + env_lo[1],
+                    initial_mm[2] + env_lo[2])
+        probe_hi = (initial_mm[0] + env_hi[0],
+                    initial_mm[1] + env_hi[1],
+                    initial_mm[2] + env_hi[2])
+        for axis_i in range(3):
+            if not (ws_lo[axis_i] <= probe_lo[axis_i]
+                    and probe_hi[axis_i] <= ws_hi[axis_i]):
+                raise AuditError(
+                    "tool envelope at initial_position_mm must lie within "
+                    "the closed workspace"
+                )
+        for index, (region_lo, region_hi) in enumerate(regions, start=1):
+            if boxes_touch_closed(probe_lo, probe_hi, region_lo, region_hi):
+                raise AuditError(
+                    "tool envelope at initial_position_mm contacts "
+                    f"forbidden region {index}"
+                )
+
     if "program" not in data or not isinstance(data["program"], str):
         raise AuditError("program must be a string")
     program = data["program"]
     if len(program.splitlines()) > MAX_PROGRAM_LINES:
         raise AuditError(f"program may contain at most {MAX_PROGRAM_LINES} lines")
 
-    return initial_mm, workspace, regions, program
+    return initial_mm, workspace, regions, program, envelope
 
 
 def _serialise_segment(move: Move) -> dict:
@@ -120,9 +173,23 @@ def audit(data: Any) -> tuple[dict | None, dict | None]:
     On any failure no dispatchable partial toolpath is ever returned.
     """
     try:
-        initial_mm, workspace, regions, program_text = _validate_request(data)
+        initial_mm, workspace, regions, program_text, envelope = (
+            _validate_request(data)
+        )
     except AuditError as exc:
         return None, {"error": "invalid_request", "reason": str(exc)}
+
+    if envelope is not None:
+        # Adjudicate the probe's swept volume instead of the bare reference
+        # point: the swept probe stays inside the workspace iff the reference
+        # segment stays inside the eroded workspace, and it touches a
+        # forbidden region iff the reference segment meets the region dilated
+        # by the reflected envelope (Minkowski sum).  Both reductions are
+        # exact in rational arithmetic, so the existing segment tests below
+        # cover the whole probe body along every motion.
+        env_lo, env_hi = envelope
+        workspace = erode_workspace(workspace, env_lo, env_hi)
+        regions = [dilate_region(region, env_lo, env_hi) for region in regions]
 
     try:
         moves, final_point = execute(program_text, initial_mm)

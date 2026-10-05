@@ -10,7 +10,7 @@ python -m compileall -q app
 echo "== [2/3] unit + API tests =="
 python -m pytest -q tests
 
-echo "== [3/3] API smoke tests (inch relative move included) =="
+echo "== [3/3] API smoke tests (inch relative move + tool envelope included) =="
 python scripts/smoke.py
 
 echo "== verify OK =="

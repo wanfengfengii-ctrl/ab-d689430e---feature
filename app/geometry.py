@@ -72,6 +72,54 @@ def point_in_closed_workspace(point: Point3, lo: Point3, hi: Point3) -> bool:
     return point_in_closed_box(point, lo, hi)
 
 
+def boxes_touch_closed(
+    a_lo: Point3,
+    a_hi: Point3,
+    b_lo: Point3,
+    b_hi: Point3,
+) -> bool:
+    """Return True if two closed boxes share at least one point."""
+    return all(a_lo[i] <= b_hi[i] and b_lo[i] <= a_hi[i] for i in range(3))
+
+
+def erode_workspace(
+    workspace: tuple[Point3, Point3],
+    env_lo: Point3,
+    env_hi: Point3,
+) -> tuple[Point3, Point3]:
+    """Erode the closed workspace by the tool-envelope offsets.
+
+    A probe occupying ``[env_lo, env_hi]`` around the reference point keeps
+    its whole body inside the workspace iff the reference point stays inside
+    this eroded box (Minkowski erosion).  The eroded box is convex, so the
+    endpoint check in :func:`first_move_violation` already covers every
+    point of a segment — and therefore the entire swept probe volume.
+    """
+    ws_lo, ws_hi = workspace
+    return (
+        (ws_lo[0] - env_lo[0], ws_lo[1] - env_lo[1], ws_lo[2] - env_lo[2]),
+        (ws_hi[0] - env_hi[0], ws_hi[1] - env_hi[1], ws_hi[2] - env_hi[2]),
+    )
+
+
+def dilate_region(
+    region: tuple[Point3, Point3],
+    env_lo: Point3,
+    env_hi: Point3,
+) -> tuple[Point3, Point3]:
+    """Dilate a forbidden region by the reflected envelope (Minkowski sum).
+
+    The probe box swept along a segment touches the region's interior or
+    boundary iff the reference segment meets this dilated closed box, so the
+    existing exact segment/box test adjudicates the whole swept volume.
+    """
+    reg_lo, reg_hi = region
+    return (
+        (reg_lo[0] - env_hi[0], reg_lo[1] - env_hi[1], reg_lo[2] - env_hi[2]),
+        (reg_hi[0] - env_lo[0], reg_hi[1] - env_lo[1], reg_hi[2] - env_lo[2]),
+    )
+
+
 def first_move_violation(
     moves: Sequence[Move],
     workspace: tuple[Point3, Point3],

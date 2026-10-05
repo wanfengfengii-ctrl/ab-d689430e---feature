@@ -1,8 +1,10 @@
 """HTTP smoke tests against the running API.
 
 Exercises the health endpoint and the audit endpoint end-to-end, including
-a program with inch-unit (G20) relative (G91) moves and a diagonal segment
-that crosses a forbidden cuboid although both endpoints are clear.
+a program with inch-unit (G20) relative (G91) moves, a diagonal segment
+that crosses a forbidden cuboid although both endpoints are clear, and the
+optional tool envelope (main flow, failure boundary, omitted-field
+regression).
 """
 
 from __future__ import annotations
@@ -97,6 +99,59 @@ def main() -> None:
     check(
         "motion-before-mode error is pinned to line 1",
         status == 422 and body.get("line") == 1,
+        body,
+    )
+
+    # --- tool envelope (offset probe head) ---
+    # Asymmetric probe: reaches 1 mm below and 2 mm above the reference in Y.
+    envelope = {"min": {"x": 0, "y": -1, "z": 0},
+                "max": {"x": 0, "y": 2, "z": 0}}
+
+    # Omitted-field regression: without the envelope the reference path at
+    # y=18.5 clears the region (y >= 20) and is accepted.
+    request = dict(base_request, program="G21 G90 G0 X0 Y18.5\nG1 X40 Y18.5")
+    status, body = http("POST", "/api/toolpaths/audit", request)
+    check(
+        "reference path without envelope is accepted",
+        status == 200 and body.get("status") == "accepted",
+        body,
+    )
+
+    # Failure boundary: the same path with the envelope grazes the region
+    # boundary (probe reaches y=20.5) -> 422, first line, region 1.
+    request = dict(request, tool_envelope_mm=envelope)
+    status, body = http("POST", "/api/toolpaths/audit", request)
+    check(
+        "envelope grazing a forbidden region is rejected",
+        status == 422
+        and body.get("error") == "forbidden_contact"
+        and body.get("line") == 2
+        and body.get("forbidden_region") == 1,
+        body,
+    )
+    check("envelope rejection exposes no partial toolpath",
+          "segments" not in body and "final_position_mm" not in body, body)
+
+    # Main flow: envelope on, path clear, response still reference-based.
+    request = dict(base_request, program="G21 G90 G0 X10 Y10",
+                   tool_envelope_mm=envelope)
+    status, body = http("POST", "/api/toolpaths/audit", request)
+    check(
+        "envelope main flow accepted with reference trajectory",
+        status == 200
+        and body.get("final_position_mm") == {"x": "10", "y": "10", "z": "0"}
+        and body["segments"][0]["end"] == {"x": "10", "y": "10", "z": "0"},
+        body,
+    )
+
+    # The whole probe at the initial position must fit the closed workspace.
+    request = dict(base_request, program="G21 G90 G0 X1",
+                   tool_envelope_mm={"min": {"x": 0, "y": 0, "z": 0},
+                                     "max": {"x": 0, "y": 0, "z": 60}})
+    status, body = http("POST", "/api/toolpaths/audit", request)
+    check(
+        "initial probe outside workspace is invalid_request",
+        status == 400 and body.get("error") == "invalid_request",
         body,
     )
 
