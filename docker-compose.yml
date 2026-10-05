@@ -1,0 +1,26 @@
+services:
+  api:
+    build: .
+    image: toolpath-audit:latest
+    environment:
+      PORT: "8080"
+    ports:
+      # Host-side port is configurable: HOST_PORT=9090 docker compose up
+      - "${HOST_PORT:-8080}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8080/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  verify:
+    build: .
+    image: toolpath-audit:latest
+    depends_on:
+      api:
+        condition: service_healthy
+    environment:
+      API_BASE_URL: "http://api:8080"
+    entrypoint: ["sh", "scripts/verify.sh"]
+    restart: "no"
